@@ -24,9 +24,9 @@ type InstanceInfo struct {
 }
 
 type RecoveryInfo struct {
-	preAcceptCount  int
-	replyCount      int
-	maxAcceptBallot *Ballot
+	preAcceptedCount  int
+	replyCount        int
+	maxAcceptedBallot *Ballot
 
 	cmds   []cmd.Command
 	deps   dependencies
@@ -132,6 +132,10 @@ func (i *Instance) setFastPath(ok bool) {
 }
 
 func (i *Instance) unionDeps(deps dependencies) bool {
+	if i.deps == nil {
+		i.deps = deps
+		return false
+	}
 	return i.deps.union(deps)
 }
 
@@ -145,4 +149,69 @@ func (i *Instance) isAfterStatus(status int8) bool {
 
 func (i *Instance) isEqualOrAfterStatus(status int8) bool {
 	return i.status >= status
+}
+
+// process PrepareReplies,
+// return true if replies are enough for further process, else return false
+func (i *Instance) processPrepareReplies(p *PrepareReply, quorumSize int) bool {
+	rInfo := i.recoveryInfo
+
+	switch p.status {
+	case accepted:
+		rInfo.status = accepted
+
+		// only record the most recent accepted instance
+		if p.ballot.Compare(rInfo.maxAcceptedBallot) > 0 {
+			rInfo.maxAcceptedBallot = p.ballot
+			rInfo.cmds, rInfo.deps = p.cmds, p.deps
+		}
+	case preAccepted:
+		if rInfo.status >= accepted {
+			break
+		}
+		rInfo.cmds, rInfo.status = p.cmds, preAccepted
+
+		// if former leader commits on fast-path,
+		// it will only send to fast-quroum,
+		// so we can safely union all deps here.
+		if rInfo.deps == nil {
+			rInfo.deps = p.deps
+		} else {
+			rInfo.deps.union(p.deps)
+		}
+		rInfo.preAcceptedCount++
+	default:
+		// receiver has no info about the instance
+	}
+
+	rInfo.replyCount++
+	if rInfo.replyCount >= quorumSize-1 {
+		return true
+	}
+	return false
+}
+
+func (i *Instance) processRecovery(quorumSize int) (status int8) {
+	rInfo := i.recoveryInfo
+
+	switch rInfo.status {
+	case accepted:
+		i.cmds, i.deps, i.status = rInfo.cmds, rInfo.deps, accepted
+	case preAccepted:
+		i.cmds, i.deps = rInfo.cmds, rInfo.deps
+		if rInfo.preAcceptedCount >= quorumSize { // N/2 + 1
+			// sendAccept()
+			i.status = accepted
+			break
+		}
+		// sendPreAccept()
+		i.status = preAccepted
+	default:
+		// no any info about instance
+		// sendPreAccept(noop)
+		i.status = preAccepted
+		i.cmds, i.deps = nil, nil // TODO: no-op
+		// [*] I forgot why we can't send accept noop here...
+	}
+	return i.status
 }

@@ -25,9 +25,19 @@ func (r *Replica) sendPrepare(replicaId int, instanceId InstanceId, messageChan 
 
 	// clean preAccepCount
 	inst.recoveryInfo = NewRecoveryInfo()
-	inst.recoveryInfo.status = preAccepted
+
+	rInfo := inst.recoveryInfo
+	switch inst.status {
+	case preAccepted:
+		rInfo.status, rInfo.preAcceptedCount = preAccepted, 1
+		rInfo.cmds, rInfo.deps = inst.cmds, inst.deps
+	case accepted:
+		rInfo.status = accepted
+		inst.recoveryInfo.maxAcceptedBallot = inst.ballot
+	}
+
 	inst.ballot.incNumber()
-	inst.ballot.setReplicaId(r.Id)
+	inst.ballot.setReplicaId(r.Id) // change replicaId to the sender of Prepare
 
 	prepare := &Prepare{
 		ballot:     inst.ballot,
@@ -35,6 +45,7 @@ func (r *Replica) sendPrepare(replicaId int, instanceId InstanceId, messageChan 
 		instanceId: instanceId,
 	}
 
+	inst.status = preparing
 	go func() {
 		for i := 0; i < r.Size-1; i++ {
 			messageChan <- prepare
@@ -89,72 +100,42 @@ func (r *Replica) recvPrepareReply(p *PrepareReply, m chan Message) {
 	inst := r.InstanceMatrix[p.replicaId][p.instanceId]
 
 	if inst == nil {
-		// it shouldn't happen
-		return
+		msg := fmt.Sprintf("shouldn't get here, replicaId = %d, instanceId = %d",
+			p.replicaId, p.instanceId)
+		panic(msg)
 	}
-	if !inst.isAtStatus(preparing) {
-		// this is a delayed message. ignore it
-		return
+
+	// update ballot
+	if p.ballot.Compare(inst.ballot) > 0 {
+		inst.ballot = p.ballot
 	}
+
 	// once we receive a "commited" reply,
-	// then we can leave preparing state and send commits
-	if p.status == committed {
+	// then we can leave preparing state and send commits.
+	// even if we are not in "preparing", we can use this info
+	// and start sending commit immediately
+	if p.status == committed && inst.status < committed {
 		inst.cmds, inst.deps, inst.status = p.cmds, p.deps, committed
 		r.sendCommit(p.replicaId, p.instanceId, m)
 		return
 	}
-	if !p.ok {
+
+	// ignore delayed messages or nacks
+	if !inst.isAtStatus(preparing) || !p.ok {
 		return
 	}
 
-	rInfo := inst.recoveryInfo
-	rInfo.replyCount++
-
-	// handle differnt replies
-	// once we receive an "accepted" reply,
-	// then we can send Accepts, but we need to send the most recent one
-	if p.status == accepted {
-		rInfo.status = accepted
-
-		// only record the most recent accepted instance
-		if p.ballot.Compare(rInfo.maxAcceptBallot) > 0 {
-			rInfo.maxAcceptBallot, rInfo.cmds, rInfo.deps = p.ballot, p.cmds, p.deps
-		}
-	}
-	// if we receive a "preAccepted" reply, and we haven't receive any "accepted" replies
-	// then we should check if we can(not) send Accept
-	if p.status == preAccepted && rInfo.status < accepted {
-		rInfo.status = preAccepted
-		rInfo.preAcceptCount++
-
-		// if violate the "N/2 identical replies" condition {
-		//         union deps
-		// }
-	}
-
-	// wait to receive enough replies
-	if rInfo.replyCount < r.QuorumSize()-1 {
+	if !inst.processPrepareReplies(p, r.QuorumSize()) {
 		return
 	}
 
-	// send the most recent Accept
-	if rInfo.status == accepted {
-		inst.cmds, inst.deps = rInfo.cmds, rInfo.deps
+	// now we have received enough relies
+	status := inst.processRecovery(r.QuorumSize())
+	switch status {
+	case accepted:
 		r.sendAccept(p.replicaId, p.instanceId, m)
-		return
+	case preAccepted:
+		inst.info.isFastPath = false
+		r.sendPreAccept(p.replicaId, p.instanceId, m)
 	}
-
-	// send Accepts or PreAccepts
-	if rInfo.status == preAccepted {
-		// if "N/2 identical" {
-		//         sendAccept()
-		//         return
-		// }
-		// sendPreAccept()
-
-		return
-	}
-
-	// sendPreAccept(noop)
-	// [*] I forgot why we can't send accept noop here...
 }
